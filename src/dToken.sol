@@ -11,7 +11,7 @@ contract dToken is IERC4626, ERC20, Ownable {
     dToken_Loan[] public loans;
 
     address public asset;
-    uint256 public isWithdrawalEnabled;
+    bool public isWithdrawalEnabled;
     uint256 public multiplierPreKink;
     uint256 public multiplierPostKink;
     uint256 public fixedInterestRate;
@@ -27,8 +27,7 @@ contract dToken is IERC4626, ERC20, Ownable {
         uint256 _kinkUtilRate, 
         uint256 _multiplierPreKink,
         uint256 _multiplierPostKink,
-        uint256 _fixedInterestRate,
-        uint256 _loanCreationFee
+        uint256 _fixedInterestRate
     ) 
     ERC20("Test dAMM Vault", "dToken") {
         asset = _asset;
@@ -43,8 +42,9 @@ contract dToken is IERC4626, ERC20, Ownable {
     mapping(address => uint) public borrowLimit;
 
     //Only enabled during withdrawal periods
-    function setWithdrawalStatus(bool _value) public onlyOwner {
+    function setWithdrawalStatus(bool _value) public onlyOwner returns(bool){
         isWithdrawalEnabled = _value;
+        return isWithdrawalEnabled;
     }
 
     function deposit(uint256 assets, address receiver) public returns (uint256) {
@@ -82,8 +82,8 @@ contract dToken is IERC4626, ERC20, Ownable {
     {
 
         uint256 _totalAssets = totalAssets();
-        uint256 totalBorrows = activeTotalBorrows();
-        uint256 totalCash = totalAssets - totalBorrows;
+        uint256 _totalBorrows = activeTotalBorrows();
+        uint256 totalCash = _totalAssets - _totalBorrows;
 
         require(totalCash >= 0, "ERROR");
         require(totalCash >= assets);
@@ -126,16 +126,17 @@ contract dToken is IERC4626, ERC20, Ownable {
     /*/ Managing borrower controls /*/
     //To remove a borrower, set their borrowLimit to 0.
     //cap an individual loan at 50-100k
-    function setBorrowerLimits(address borrower, uint256 borrowAllowance) public onlyOwner returns(address, uint) {
+    function setBorrowerLimits(address borrower, uint256 borrowAllowance) public onlyOwner {
         //adjust the borrower's  limit for a specific dToken
         borrowLimit[borrower] = borrowAllowance;
         emit borrowerLimitChanged(borrower, borrowAllowance);
     }
 
     function currentUtilRate() public view returns(uint) {
-        uint256 _totalAssets = totalAssets();
-        uint256 _utilRate = activeBorrows / totalAssets;
-        return _utilRate;
+         uint256 totalAssetstwo = totalAssets();
+         uint256 activeBorrowstwo = activeTotalBorrows();
+         uint256 utilRate = activeBorrowstwo / totalAssetstwo;
+        return utilRate;
     }
 
     function currentBorrowRate() public view returns(uint) {
@@ -148,7 +149,7 @@ contract dToken is IERC4626, ERC20, Ownable {
             uint256 interestRatePreKink = kinkUtilRate * multiplierPreKink;
             uint256 postKinkUtil = _utilRate - kinkUtilRate;
             uint256 interestRatePostKink = postKinkUtil * multiplierPostKink;
-            uint256 interestRate = interestRatePreKink + interestRatePostKink + _fixedInterestRate;
+            uint256 interestRate = interestRatePreKink + interestRatePostKink + fixedInterestRate;
             return interestRate;
         }
     }
@@ -162,16 +163,17 @@ contract dToken is IERC4626, ERC20, Ownable {
 
     function createLoan(address _borrower, uint256 _loanSize, uint256 _loanLengthInDays) public onlyOwner returns(address, uint) {
 
-        require(borrowLimit[borrower] >= 0, "Cannot request a loan without permission");
-        require(borrowLimit[borrower] >= borrowAllowance, "Cannot request a loan of greater size than permitted");
+        require(borrowLimit[_borrower] >= 0, "Cannot request a loan without permission");
+        require(borrowLimit[_borrower] >= _loanSize, "Cannot request a loan of greater size than permitted");
         require(_loanSize <= ERC20(asset).balanceOf(address(this)), "Cannot borrow more capital than is current in the pool");
 
         uint256 _borrowRate = currentBorrowRate();
-        uint256 creationFee = (loanCreationFee/10000) * loanSize;
-        uint256 loanMinusFee = loanSize - creationFee;
+        uint256 creationFee = (loanCreationFee/10000) * _loanSize;
+        uint256 loanMinusFee = _loanSize - creationFee;
 
         //Collateral is a multiple of the collateralRate variable
-        dToken_Loan loan = new dToken_Loan(_borrower, loanMinusFee, _borrowRate, 2, loanCreationFee, loanLengthInDays);
+        dToken_Loan loan = new dToken_Loan(_borrower, loanMinusFee, _borrowRate, 2, loanCreationFee, _loanLengthInDays);
+        loans.push(loan);
         //Treasury collects loan creation fee
         ERC20(asset).transfer(_borrower, creationFee);
         //Loan value is transferred to borrower
@@ -183,10 +185,10 @@ contract dToken is IERC4626, ERC20, Ownable {
     /*/ Read only dToken_Loan Functions /*/
 
     function getActiveLoans() public view returns (dToken_Loan[] memory) {
-        dToken_Loan[] memory activeLoans = new LockedWETHOffer[](loans.length);
+        dToken_Loan[] memory activeLoans = new dToken_Loan[](loans.length);
         uint256 count;
         for (uint256 i; i < loans.length; i++) {
-            LockedWETHOffer loan = LockedWETHOffer(loans[i]);
+            dToken_Loan loan = dToken_Loan(loans[i]);
             if (!loan.hasEnded()) {
                 activeLoans[count++] = loan;
             }
@@ -196,17 +198,15 @@ contract dToken is IERC4626, ERC20, Ownable {
     }
 
     function activeTotalBorrows() public view returns (uint) {
-        dToken_Loan[] memory activeLoans = new LockedWETHOffer[](loans.length);
-        uint256 count;
         uint256 total;
         for (uint256 i; i < loans.length; i++) {
-            LockedWETHOffer loan = LockedWETHOffer(loans[i]);
+            dToken_Loan loan = dToken_Loan(loans[i]);
             if (!loan.hasEnded()) {
-                loan[1] += total;
+                uint256 loanAmount = loan.returnLoanSize();
+                loanAmount += total;
             }
         }
-        totalBorrows = total;
-        return totalBorrows;
+        return total;
     }
 
     /*/ Read only functions/Non-state changing /*/

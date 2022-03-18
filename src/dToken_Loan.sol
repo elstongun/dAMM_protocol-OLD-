@@ -26,7 +26,6 @@ contract dToken_Loan {
 
 
     constructor(
-        address _dTokenPool,
         address _borrower,
         uint256 _loanSize,
         uint256 _borrowRate,
@@ -34,7 +33,7 @@ contract dToken_Loan {
         uint256 _loanCreationFee,
         uint256 _loanLengthInDays
     ) {
-        dTokenPool = msg.sender;
+        dTokenPool = msg.sender; //check that this actually works
         borrower = _borrower;
         loanSize = _loanSize;
         borrowRate = _borrowRate;
@@ -62,12 +61,17 @@ contract dToken_Loan {
         //confirming the loan was paid back
         require(hasEnded == true);
 
-        emit CollateralReturned(borrower, ERC20(dAMM).balanceOf(address(this)));
-        IERC20(dAMM).transfer(borrower, ERC20(dAMM).balanceOf(address(this)));
+        emit CollateralReturned(borrower, IERC20(dAMM).balanceOf(address(this)));
+        IERC20(dAMM).transfer(borrower, IERC20(dAMM).balanceOf(address(this)));
     }
     //create withdraw collateral function incase of no repayment
+    function withdrawCollateral() public {
+        require(msg.sender == dAMM_comptroller, "You are not the comptroller we are looking for...");
 
-    function repayLoan() public returns(uint) {
+        IERC20(dAMM).transfer(dAMM_comptroller, IERC20(dAMM).balanceOf(address(this)));
+    }
+
+    function repayLoan() public {
         require(msg.sender == borrower, "Only callable by the borrower");
 
         uint principalOwed = loanSize;
@@ -76,10 +80,14 @@ contract dToken_Loan {
 
         require(IERC20(dTokenAssetAddress).balanceOf(msg.sender) >= totalOwed, "Loan repayment exceeds your current balance.");
 
-        IERC20(dTokenAssetAddress).transferFrom(borrower, IOwnable(dTokenPool).owner(), totalOwed);
+        IERC20(dTokenAssetAddress).transferFrom(borrower, dTokenPool, totalOwed); 
+        //should transfer back to pool but need to test
 
         emit LoanRepaid(borrower, loanSize, borrowRate, interestOwed);
         hasEnded = true;
+    }
+    function returnLoanSize() public view returns(uint) {
+        return loanSize;
     }
 }
 
