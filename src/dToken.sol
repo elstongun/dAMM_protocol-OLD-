@@ -4,52 +4,67 @@ pragma solidity >=0.8.0;
 import './utils/ERC20.sol';
 import './utils/IERC4626.sol';
 import './utils/Ownable.sol';
-import './dToken_Loan.sol';
+import {SafeERC20} from './utils/SafeERC20.sol';
 
 contract dToken is IERC4626, ERC20, Ownable {
-
-    dToken_Loan[] public loans;
 
     address public asset;
     bool public isWithdrawalEnabled;
     uint256 public multiplierPreKink;
     uint256 public multiplierPostKink;
     uint256 public fixedInterestRate;
-    uint256 public kinkUtilRate;
-    uint256 public loanCreationFee;
+    uint256 public kink;
+    uint256 public rFactor;
+    uint256 public totalBorrows;
+    uint256 public borrowIndex;
+    uint256 public currentAssets;
+    uint256 public accrualBlockNumber;
+    uint256 public blocksPerYear;
+    uint256 public fixedRatePerBlock;
+    
 
     event borrowerLimitChanged(address borrower, uint256 _borrowLimit);
-    event assetsBorrowed(address borrower, uint256 amountBorrowed);
-    event assetsReturned(address borrower, uint256 amountBorrowedPlusInterest);
+    event assetsBorrowed(address borrower, uint256 amountBorrowed, uint _totalBorrows);
+    event RepayBorrow(address payer, address borrower, uint actualRepayAmount, uint accountBorrowsNew, uint totalBorrowsNew);
+    event interestAccrued(uint currentAssets, uint interestAccumulated, uint borrowIndexNew, uint totalBorrowsNew);
+
 
     constructor(
         address _asset, 
-        uint256 _kinkUtilRate, 
-        uint256 _multiplierPreKink,
-        uint256 _multiplierPostKink,
-        uint256 _fixedInterestRate
+        uint256 _kink, //Must input as a Mantissa in 1e18 scale
+        uint256 _multiplierPreKink, //Must input as a mantissa in 1e18 scale
+        uint256 _multiplierPostKink, //Must input as a mantissa in 1e18 scale
+        uint256 _fixedInterestRate //Must input as a mantissa in 1e18 scale
     ) 
     ERC20("Test dAMM Vault", "dToken") {
         asset = _asset;
         isWithdrawalEnabled = false;
-        multiplierPreKink = _multiplierPreKink;
-        multiplierPostKink = _multiplierPostKink;
-        fixedInterestRate = _fixedInterestRate;
-        kinkUtilRate = _kinkUtilRate;
-        loanCreationFee = 30; //in BPS
+        multiplierPreKink = _multiplierPreKink; 
+        multiplierPostKink = _multiplierPostKink; 
+        fixedInterestRate = _fixedInterestRate; 
+        kink = _kink; //Mantissa
+        rFactor = 0.25 * 1e18;
+        totalBorrows = 0;
+        borrowIndex = 1*1e18;
+        accrualBlockNumber = getBlockNumber();
+        blocksPerYear = 2102400;
+        fixedRatePerBlock = _fixedInterestRate / blocksPerYear;
     }
 
-    mapping(address => uint) public borrowLimit;
+    mapping(address => uint256) public borrowLimit;
+    mapping(address => uint256) public currentBorrows;
 
-    //Only enabled during withdrawal periods
-    function setWithdrawalStatus(bool _value) public onlyOwner returns(bool){
-        isWithdrawalEnabled = _value;
-        return isWithdrawalEnabled;
+    struct BorrowSnapshot {
+        uint256 principal;
+        uint256 interestIndex;
     }
+
+    mapping(address => BorrowSnapshot) internal accountBorrows;
 
     function deposit(uint256 assets, address receiver) public returns (uint256) {
-        uint256 _totalAssets = totalAssets();
-        uint256 shares = convertToShares(_totalAssets);
+
+        currentAssets = totalAssets();
+        uint256 shares = convertToShares(currentAssets);
         ERC20(asset).transferFrom(msg.sender, address(this), assets);
 
         _mint(receiver, shares);
@@ -57,7 +72,6 @@ contract dToken is IERC4626, ERC20, Ownable {
 
         return shares;
     }
-
 
     function mint(uint256 shares, address receiver) public returns (uint256) {
         uint256 assets = convertToAssets(shares);
@@ -72,24 +86,14 @@ contract dToken is IERC4626, ERC20, Ownable {
         return assets;
     }
 
-    function withdraw(
-        uint256 assets,
-        address receiver,
-        address owner
-    )
-        public
-        returns (uint256)
-    {
-
+    function withdraw(uint256 assets, address receiver, address owner) public returns (uint256) {
         uint256 _totalAssets = totalAssets();
-        uint256 _totalBorrows = activeTotalBorrows();
-        uint256 totalCash = _totalAssets - _totalBorrows;
+        uint256 totalCash = _totalAssets - totalBorrows;
 
         require(totalCash >= 0, "ERROR");
-        require(totalCash >= assets);
+        require(totalCash >= assets, "Sufficient liquidity is not available for withdrawal");
     
-        require(isWithdrawalEnabled == false, "Withdrawal is currently disabled. See www.dAMM.finance for the current withdrawal schedule.");
-
+        require(isWithdrawalEnabled == true, "Withdrawal is currently disabled.");
         uint256 shares = convertToShares(assets);
 
         _spendAllowance(owner, msg.sender, shares);
@@ -101,16 +105,8 @@ contract dToken is IERC4626, ERC20, Ownable {
         return shares;
     }
 
-    function redeem(
-        uint256 shares,
-        address receiver,
-        address owner
-    )
-        public
-        returns (uint256)
-    {
-    
-        require(isWithdrawalEnabled == false, "Withdrawal is currently disabled. See www.dAMM.finance for the current withdrawal schedule.");
+    function redeem(uint256 shares, address receiver, address owner) public returns (uint256) {
+        require(isWithdrawalEnabled == true, "Withdrawal is currently disabled. See www.dAMM.finance for the current withdrawal schedule.");
 
         uint256 assets = convertToAssets(shares);
 
@@ -123,104 +119,219 @@ contract dToken is IERC4626, ERC20, Ownable {
         return assets;
     }
 
-    /*/ Managing borrower controls /*/
-    //To remove a borrower, set their borrowLimit to 0.
-    //cap an individual loan at 50-100k
+    /*/ 
+    
+    
+    
+        Managing Borrowers and Their Limits, Creating and Repaying Loans
+    
+    
+    
+    /*/
+
+    function setWithdrawalStatus(bool _value) public onlyOwner returns(bool) {
+        isWithdrawalEnabled = _value;
+        return isWithdrawalEnabled;
+    }
+
     function setBorrowerLimits(address borrower, uint256 borrowAllowance) public onlyOwner {
         //adjust the borrower's  limit for a specific dToken
         borrowLimit[borrower] = borrowAllowance;
         emit borrowerLimitChanged(borrower, borrowAllowance);
     }
 
-    function currentUtilRate() public view returns(uint) {
-         uint256 totalAssetstwo = totalAssets();
-         uint256 activeBorrowstwo = activeTotalBorrows();
-         uint256 utilRate = activeBorrowstwo / totalAssetstwo;
-        return utilRate;
+    function setInterestRateModel(uint kink_, uint multiplierPreKink_, uint multiplierPostKink_, uint fixedInterestRate_) public onlyOwner returns(uint, uint, uint, uint) {
+        kink = kink_;
+        multiplierPreKink = multiplierPreKink_;
+        multiplierPostKink = multiplierPostKink_;
+        fixedRatePerBlock = fixedInterestRate_ / blocksPerYear;
+        return (kink, multiplierPreKink, multiplierPostKink, fixedRatePerBlock);
     }
 
-    function currentBorrowRate() public view returns(uint) {
-        uint256 _utilRate = currentUtilRate();
-
-        if (_utilRate <= kinkUtilRate) {
-            uint256 interestRate = _utilRate * multiplierPreKink;
-            return interestRate;
-        } else {
-            uint256 interestRatePreKink = kinkUtilRate * multiplierPreKink;
-            uint256 postKinkUtil = _utilRate - kinkUtilRate;
-            uint256 interestRatePostKink = postKinkUtil * multiplierPostKink;
-            uint256 interestRate = interestRatePreKink + interestRatePostKink + fixedInterestRate;
-            return interestRate;
-        }
+    struct BorrowLocalVars {
+        uint256 accountBorrows;
+        uint256 accountBorrowsNew;
+        uint256 totalBorrowsNew;
     }
 
-    function currentSupplyRate() public view returns (uint256) {
-        uint256 _currentBorrowRate = currentBorrowRate();
-        uint256 _currentUtilRate = currentUtilRate();
-        uint256 supplyRate = _currentBorrowRate * _currentUtilRate * (1 - multiplierPreKink);
-        return supplyRate;
-    }
-
-    function createLoan(address _borrower, uint256 _loanSize, uint256 _loanLengthInDays) public onlyOwner returns(address, uint) {
+    function createLoan(address _borrower, uint256 _loanSize) public onlyOwner {
 
         require(borrowLimit[_borrower] >= 0, "Cannot request a loan without permission");
         require(borrowLimit[_borrower] >= _loanSize, "Cannot request a loan of greater size than permitted");
+        require((borrowLimit[_borrower] + _loanSize) <= storedBorrowsInternal(_borrower), "Cannot borrow more than permitted");
         require(_loanSize <= ERC20(asset).balanceOf(address(this)), "Cannot borrow more capital than is current in the pool");
+        require(accrualBlockNumber == getBlockNumber(), "Accrual Block does not equal current block");
 
-        uint256 _borrowRate = currentBorrowRate();
-        uint256 creationFee = (loanCreationFee/10000) * _loanSize;
-        uint256 loanMinusFee = _loanSize - creationFee;
+        BorrowLocalVars memory vars;
 
-        //Collateral is a multiple of the collateralRate variable
-        dToken_Loan loan = new dToken_Loan(_borrower, loanMinusFee, _borrowRate, 2, loanCreationFee, _loanLengthInDays);
-        loans.push(loan);
-        //Treasury collects loan creation fee
-        ERC20(asset).transfer(_borrower, creationFee);
+        uint256 borrowsPrior = totalBorrows;
+        uint256 totalAssetsPrior = totalAssets();
+
+        uint256 _borrowRateMantissa = currentBorrowRate(totalAssetsPrior, borrowsPrior);        
+        vars.accountBorrows = storedBorrowsInternal(_borrower);
+
+        //new values locally stored
+
+        //   accountBorrowsNew = accountBorrows + borrowAmount
+         //  totalBorrowsNew = totalBorrows + borrowAmount
+        vars.accountBorrowsNew =  vars.accountBorrows + _loanSize;
+        vars.totalBorrowsNew = totalBorrows + _loanSize;
+
         //Loan value is transferred to borrower
-        ERC20(asset).transfer(_borrower, loanMinusFee);
+        doSafeTransferOut(_borrower, _loanSize);
 
-        emit assetsBorrowed(_borrower, _loanSize);
+        //write new borrowsnapshots to storage
+        accountBorrows[_borrower].principal = vars.accountBorrowsNew;
+        accountBorrows[_borrower].interestIndex = borrowIndex;
+
+        //write new total borrows to storage
+        totalBorrows = vars.totalBorrowsNew;
+
+        emit assetsBorrowed(_borrower, _loanSize, totalBorrows);
+    }
+    
+    function storedBorrowsInternal(address _borrower) internal view returns(uint256) {
+        BorrowSnapshot storage borrowSnapshot = accountBorrows[_borrower];
+        
+        uint totalOwed = borrowSnapshot.principal + borrowSnapshot.interestIndex;
+
+        return totalOwed;
     }
 
-    /*/ Read only dToken_Loan Functions /*/
+    struct RepayBorrowLocalVars {
+        uint repayAmount;
+        uint borrowerIndex;
+        uint accountBorrows;
+        uint accountBorrowsNew;
+        uint totalBorrowsNew;
+        uint actualRepayAmount;
+    }
 
-    function getActiveLoans() public view returns (dToken_Loan[] memory) {
-        dToken_Loan[] memory activeLoans = new dToken_Loan[](loans.length);
-        uint256 count;
-        for (uint256 i; i < loans.length; i++) {
-            dToken_Loan loan = dToken_Loan(loans[i]);
-            if (!loan.hasEnded()) {
-                activeLoans[count++] = loan;
-            }
+    function repayLoan(address _payer, address _borrower, uint256 repayAmount) public returns(uint256) {
+        require(accrualBlockNumber == getBlockNumber(), "Accrual Block does not equal current block");
+
+        RepayBorrowLocalVars memory vars;
+        
+        vars.borrowerIndex = accountBorrows[_borrower].interestIndex;
+        vars.accountBorrows = storedBorrowsInternal(_borrower);
+
+        /* If repayAmount == -1, repayAmount = accountBorrows */
+        if (repayAmount == type(uint).max) {
+            vars.repayAmount = vars.accountBorrows;
+        } else {
+            vars.repayAmount = repayAmount;
         }
 
-        return activeLoans;
+        //confirm the actual repay amount
+        vars.actualRepayAmount = doSafeTransferIn(_payer, vars.repayAmount);
+
+        //locally store the users new borrow balances
+        vars.accountBorrowsNew = vars.accountBorrows - vars.actualRepayAmount;
+        vars.totalBorrowsNew = totalBorrows - vars.actualRepayAmount;
+
+        //Write new variables to storage
+        accountBorrows[_borrower].principal = vars.accountBorrowsNew;
+        accountBorrows[_borrower].interestIndex = borrowIndex;
+        totalBorrows = vars.totalBorrowsNew;
+        emit RepayBorrow(_payer, _borrower, vars.actualRepayAmount, vars.accountBorrowsNew, vars.totalBorrowsNew);
+        
+        return vars.actualRepayAmount;
     }
 
-    function activeTotalBorrows() public view returns (uint) {
-        uint256 total;
-        for (uint256 i; i < loans.length; i++) {
-            dToken_Loan loan = dToken_Loan(loans[i]);
-            if (!loan.hasEnded()) {
-                uint256 loanAmount = loan.returnLoanSize();
-                loanAmount += total;
-            }
+    function accrueInterest() public returns (uint) {
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 accrualBlockNumberPrior = accrualBlockNumber;
+        
+        currentAssets = totalAssets();
+        totalBorrows = currentTotalBorrows();
+
+        //get current borrows
+        uint256 _borrowRateMantissa = currentBorrowRate(currentAssets, totalBorrows);
+        
+        //blocks since last accrual
+        uint256 blockDelta = currentBlockNumber - accrualBlockNumber;
+
+        //interest calculations
+        uint256 simpleInterestFactor = _borrowRateMantissa * blockDelta;
+        uint256 interestAccumulated = simpleInterestFactor * totalBorrows;
+        uint256 totalBorrowsNew = totalBorrows + interestAccumulated;
+        uint256 borrowIndexNew = simpleInterestFactor = _borrowRateMantissa * borrowIndex + borrowIndex;
+
+        // pee pee poo poo (  )=)====D --- from adam
+        //store new variables
+        accrualBlockNumber = currentBlockNumber;
+        totalBorrows = totalBorrowsNew;
+        borrowIndex = borrowIndexNew;
+        emit interestAccrued(currentAssets, interestAccumulated, borrowIndexNew, totalBorrowsNew);
+
+        return accrualBlockNumber;
+    }
+
+
+
+    /*/ 
+    
+    
+    
+                Internal Utilization and Interest Rate Functions 
+    
+    
+    
+    /*/
+
+    function utilizationRate(uint _totalAssets, uint _totalBorrows) internal view returns(uint) {
+        if(_totalBorrows == 0) {
+            return 0;
         }
-        return total;
+        uint256 utilRate = (_totalBorrows / _totalAssets) * 1e18 ;
+        return utilRate;
     }
 
-    /*/ Read only functions/Non-state changing /*/
 
+    function currentBorrowRate(uint _totalAssets, uint _totalBorrows) internal view returns(uint256) {
+        uint256 util = utilizationRate(_totalAssets, _totalBorrows);
+        if (util <= kink) {
+            return ((util * multiplierPreKink) / 1e18) + fixedRatePerBlock;
+        } else {
+            uint256 baseRate = (kink * multiplierPreKink) / 1e18;
+            uint256 additionalRate = ((util - kink) * multiplierPostKink) / 1e18;
+            return (baseRate + additionalRate) + fixedRatePerBlock;
+        }
+    }
+    
+    function currentSupplyRate(uint _totalAssets, uint _totalBorrows) internal view returns (uint256) {
+        uint256 util = utilizationRate(_totalAssets, _totalBorrows);
+        uint256 borrowRate = currentBorrowRate(_totalAssets, _totalBorrows);
+        uint256 supplyRatePre = (borrowRate * util) / 1e18;
+        return (supplyRatePre * (1 - rFactor)) / 1e18;
+    }
 
-
-
-
+    /*/ 
+    
+    
+    
+                Read only dToken Functions 
+    
+    
+    
+    /*/
+    
     function totalAssets() public view returns (uint256) {
-        //includes loaned capital
-        uint256 activeBorrows = activeTotalBorrows();
-        uint256 total = ERC20(asset).balanceOf(address(this)) + activeBorrows;
-        return total;
+        return ERC20(asset).balanceOf(address(this)) + totalBorrows;
     }
+
+    function currentTotalBorrows() public view returns (uint) {
+        return totalBorrows;
+    }
+
+    //create totalborrows call function
+    
+    function getActiveLoansByUser(address borrower) public view returns (uint256) {
+        uint256 result = storedBorrowsInternal(borrower);
+        return result;
+    }
+
+        /*/ Read only functions/Non-state changing /*/
 
     function convertToAssets(uint256 shares) public view returns (uint256) {
         uint256 _totalSupply = totalSupply();
@@ -273,5 +384,23 @@ contract dToken is IERC4626, ERC20, Ownable {
 
     function getBorrowerLimits(address borrower) external view returns(uint) {
         return borrowLimit[borrower];
+    }
+
+    function doSafeTransferIn(address borrower, uint256 repayAmount) internal returns(uint256) {
+
+        SafeERC20.safeTransferFrom(ERC20(asset), borrower, address(this), repayAmount);
+        
+        return repayAmount;
+    }
+
+    function doSafeTransferOut(address borrower, uint256 loanAmount) internal returns(uint256) {
+
+        SafeERC20.safeTransfer(ERC20(asset), borrower, loanAmount);
+        
+        return loanAmount;
+    }
+
+    function getBlockNumber() public view returns(uint256) {
+        return block.number;
     }
 }
