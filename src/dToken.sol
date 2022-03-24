@@ -10,8 +10,8 @@ contract dToken is IERC4626, ERC20, Ownable {
 
     address public asset;
     bool public isWithdrawalEnabled;
-    uint256 public multiplierPreKink;
-    uint256 public multiplierPostKink;
+    uint256 public multiplierPerBlock;
+    uint256 public jumpMultiplierPerBlock;
     uint256 public fixedInterestRate;
     uint256 public kink;
     uint256 public rFactor;
@@ -24,23 +24,23 @@ contract dToken is IERC4626, ERC20, Ownable {
     
 
     event borrowerLimitChanged(address borrower, uint256 _borrowLimit);
-    event assetsBorrowed(address borrower, uint256 amountBorrowed, uint _totalBorrows);
-    event RepayBorrow(address payer, address borrower, uint actualRepayAmount, uint accountBorrowsNew, uint totalBorrowsNew);
-    event interestAccrued(uint currentAssets, uint interestAccumulated, uint borrowIndexNew, uint totalBorrowsNew);
+    event assetsBorrowed(address borrower, uint256 amountBorrowed, uint256 _totalBorrows);
+    event RepayBorrow(address payer, address borrower, uint256 actualRepayAmount, uint256 accountBorrowsNew, uint256 totalBorrowsNew);
+    event interestAccrued(uint256 currentAssets, uint256 interestAccumulated, uint256 borrowIndexNew, uint256 totalBorrowsNew);
 
 
     constructor(
         address _asset, 
         uint256 _kink, //Must input as a Mantissa in 1e18 scale
-        uint256 _multiplierPreKink, //Must input as a mantissa in 1e18 scale
-        uint256 _multiplierPostKink, //Must input as a mantissa in 1e18 scale
+        uint256 _multiplierPerBlock, //Must input as a mantissa in 1e18 scale
+        uint256 _jumpMultiplierPerBlock, //Must input as a mantissa in 1e18 scale
         uint256 _fixedInterestRate //Must input as a mantissa in 1e18 scale
     ) 
     ERC20("Test dAMM Vault", "dToken") {
         asset = _asset;
         isWithdrawalEnabled = false;
-        multiplierPreKink = _multiplierPreKink; 
-        multiplierPostKink = _multiplierPostKink; 
+        multiplierPerBlock = _multiplierPerBlock; 
+        jumpMultiplierPerBlock = _jumpMultiplierPerBlock; 
         fixedInterestRate = _fixedInterestRate; 
         kink = _kink; //Mantissa
         rFactor = 0.25 * 1e18;
@@ -140,12 +140,12 @@ contract dToken is IERC4626, ERC20, Ownable {
         emit borrowerLimitChanged(borrower, borrowAllowance);
     }
 
-    function setInterestRateModel(uint kink_, uint multiplierPreKink_, uint multiplierPostKink_, uint fixedInterestRate_) public onlyOwner returns(uint, uint, uint, uint) {
+    function setInterestRateModel(uint256 kink_, uint256 multiplierPerBlock_, uint256 jumpMultiplierPerBlock_, uint256 fixedInterestRate_) public onlyOwner returns(uint, uint, uint, uint) {
         kink = kink_;
-        multiplierPreKink = multiplierPreKink_;
-        multiplierPostKink = multiplierPostKink_;
+        multiplierPerBlock = multiplierPerBlock_;
+        jumpMultiplierPerBlock = jumpMultiplierPerBlock_;
         fixedRatePerBlock = fixedInterestRate_ / blocksPerYear;
-        return (kink, multiplierPreKink, multiplierPostKink, fixedRatePerBlock);
+        return (kink, multiplierPerBlock, jumpMultiplierPerBlock, fixedRatePerBlock);
     }
 
     struct BorrowLocalVars {
@@ -154,20 +154,17 @@ contract dToken is IERC4626, ERC20, Ownable {
         uint256 totalBorrowsNew;
     }
 
-    function createLoan(address _borrower, uint256 _loanSize) public onlyOwner {
+    function createLoan(address _borrower, uint256 _loanSize) public returns(address, uint256, uint256) {
+        
+        accrueInterest();
+        require(accrualBlockNumber == getBlockNumber(), "Accrual Block does not equal current block");
 
         require(borrowLimit[_borrower] >= 0, "Cannot request a loan without permission");
-        require(borrowLimit[_borrower] >= _loanSize, "Cannot request a loan of greater size than permitted");
-        require((borrowLimit[_borrower] + _loanSize) <= storedBorrowsInternal(_borrower), "Cannot borrow more than permitted");
+        require(borrowLimit[_borrower] >= (_loanSize + storedBorrowsInternal(_borrower)), "Cannot borrow more than permitted");
         require(_loanSize <= ERC20(asset).balanceOf(address(this)), "Cannot borrow more capital than is current in the pool");
-        require(accrualBlockNumber == getBlockNumber(), "Accrual Block does not equal current block");
 
         BorrowLocalVars memory vars;
 
-        uint256 borrowsPrior = totalBorrows;
-        uint256 totalAssetsPrior = totalAssets();
-
-        uint256 _borrowRateMantissa = currentBorrowRate(totalAssetsPrior, borrowsPrior);        
         vars.accountBorrows = storedBorrowsInternal(_borrower);
 
         //new values locally stored
@@ -188,23 +185,24 @@ contract dToken is IERC4626, ERC20, Ownable {
         totalBorrows = vars.totalBorrowsNew;
 
         emit assetsBorrowed(_borrower, _loanSize, totalBorrows);
+        return(_borrower, _loanSize, totalBorrows);
     }
     
     function storedBorrowsInternal(address _borrower) internal view returns(uint256) {
         BorrowSnapshot storage borrowSnapshot = accountBorrows[_borrower];
         
-        uint totalOwed = borrowSnapshot.principal + borrowSnapshot.interestIndex;
+        uint256 totalOwed = borrowSnapshot.principal + borrowSnapshot.interestIndex;
 
         return totalOwed;
     }
 
     struct RepayBorrowLocalVars {
-        uint repayAmount;
-        uint borrowerIndex;
-        uint accountBorrows;
-        uint accountBorrowsNew;
-        uint totalBorrowsNew;
-        uint actualRepayAmount;
+        uint256 repayAmount;
+        uint256 borrowerIndex;
+        uint256 accountBorrows;
+        uint256 accountBorrowsNew;
+        uint256 totalBorrowsNew;
+        uint256 actualRepayAmount;
     }
 
     function repayLoan(address _payer, address _borrower, uint256 repayAmount) public returns(uint256) {
@@ -238,10 +236,12 @@ contract dToken is IERC4626, ERC20, Ownable {
         return vars.actualRepayAmount;
     }
 
-    function accrueInterest() public returns (uint) {
+    function accrueInterest() public returns (bool) {
         uint256 currentBlockNumber = getBlockNumber();
         uint256 accrualBlockNumberPrior = accrualBlockNumber;
         
+        require(accrualBlockNumberPrior == currentBlockNumber);
+
         currentAssets = totalAssets();
         totalBorrows = currentTotalBorrows();
 
@@ -264,7 +264,7 @@ contract dToken is IERC4626, ERC20, Ownable {
         borrowIndex = borrowIndexNew;
         emit interestAccrued(currentAssets, interestAccumulated, borrowIndexNew, totalBorrowsNew);
 
-        return accrualBlockNumber;
+        return true;
     }
 
 
@@ -279,7 +279,7 @@ contract dToken is IERC4626, ERC20, Ownable {
     
     /*/
 
-    function utilizationRate(uint _totalAssets, uint _totalBorrows) internal view returns(uint) {
+    function utilizationRate(uint256 _totalAssets, uint256 _totalBorrows) public pure returns(uint) {
         if(_totalBorrows == 0) {
             return 0;
         }
@@ -288,18 +288,19 @@ contract dToken is IERC4626, ERC20, Ownable {
     }
 
 
-    function currentBorrowRate(uint _totalAssets, uint _totalBorrows) internal view returns(uint256) {
+    function currentBorrowRate(uint256 _totalAssets, uint256 _totalBorrows) internal view returns(uint256) {
         uint256 util = utilizationRate(_totalAssets, _totalBorrows);
+
         if (util <= kink) {
-            return ((util * multiplierPreKink) / 1e18) + fixedRatePerBlock;
+            return ((util * multiplierPerBlock) / 1e18) + fixedRatePerBlock;
         } else {
-            uint256 baseRate = (kink * multiplierPreKink) / 1e18;
-            uint256 additionalRate = ((util - kink) * multiplierPostKink) / 1e18;
-            return (baseRate + additionalRate) + fixedRatePerBlock;
+            uint256 baseRatePerBlock = (kink * multiplierPerBlock) / 1e18;
+            uint256 additionalRatePerBlock = ((util - kink) * jumpMultiplierPerBlock) / 1e18;
+            return (baseRatePerBlock + additionalRatePerBlock) + fixedRatePerBlock;
         }
     }
     
-    function currentSupplyRate(uint _totalAssets, uint _totalBorrows) internal view returns (uint256) {
+    function currentSupplyRate(uint256 _totalAssets, uint256 _totalBorrows) public view returns (uint256) {
         uint256 util = utilizationRate(_totalAssets, _totalBorrows);
         uint256 borrowRate = currentBorrowRate(_totalAssets, _totalBorrows);
         uint256 supplyRatePre = (borrowRate * util) / 1e18;
@@ -360,7 +361,7 @@ contract dToken is IERC4626, ERC20, Ownable {
         return assets;
     }
 
-    function maxMint(address receiver) external view returns (uint256) {
+    function maxMint(address receiver) public pure returns (uint256) {
         return type(uint256).max;
     }
     
